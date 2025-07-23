@@ -1,0 +1,242 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jwt-secret
+  namespace: ethereum
+data:
+  # Generate JWT secret: openssl rand -hex 32
+  secret: "aced7325ad6f01b0f5a405ac1b04f9fbd768e9d382e953c5bb25487dd874f443"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: geth-data-pvc
+  namespace: ethereum
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # Use the default storage class or specify one that exists in your cluster
+  # Common alternatives: gp2, gp3, ssd, fast-ssd, standard-rwo
+  storageClassName: standard-rwo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lighthouse-data-pvc
+  namespace: ethereum
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # Use the default storage class or specify one that exists in your cluster
+  storageClassName: standard-rwo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: geth
+  namespace: ethereum
+spec:
+  selector:
+    app: geth
+  ports:
+  - name: http-rpc
+    port: 8545
+    targetPort: 8545
+  - name: ws-rpc
+    port: 8546
+    targetPort: 8546
+  - name: auth-rpc
+    port: 8551
+    targetPort: 8551
+  - name: metrics
+    port: 6060
+    targetPort: 6060
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geth
+  namespace: ethereum
+  labels:
+    app: geth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: geth
+  template:
+    metadata:
+      labels:
+        app: geth
+    spec:
+      # Disable automatic service environment variable creation
+      enableServiceLinks: false
+      containers:
+      - name: geth
+        image: ethereum/client-go:latest
+        ports:
+        - containerPort: 8545
+          name: http-rpc
+        - containerPort: 8546
+          name: ws-rpc
+        - containerPort: 30303
+          name: p2p
+        - containerPort: 8551
+          name: auth-rpc
+        - containerPort: 6060
+          name: metrics
+        volumeMounts:
+        - name: geth-data
+          mountPath: /root/.ethereum
+        - name: jwt-secret
+          mountPath: /root/jwt
+          readOnly: true
+        command:
+        - geth
+        args:
+        - --sepolia
+        - --syncmode=snap
+        - --http
+        - --http.addr=0.0.0.0
+        - --http.port=8545
+        - --http.corsdomain=*
+        - --http.vhosts=*
+        - --http.api=eth,net,web3
+        - --ws
+        - --ws.addr=0.0.0.0
+        - --ws.port=8546
+        - --ws.api=eth,net,web3
+        - --cache=1024
+        - --maxpeers=50
+        - --metrics
+        - --metrics.addr=0.0.0.0
+        - --metrics.port=6060
+        - --authrpc.addr=0.0.0.0
+        - --authrpc.port=8551
+        - --authrpc.vhosts=*
+        - --authrpc.jwtsecret=/root/jwt/secret
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8545
+          initialDelaySeconds: 180
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8545
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "1000m"
+          limits:
+            memory: "8Gi"
+            cpu: "2000m"
+      volumes:
+      - name: geth-data
+        persistentVolumeClaim:
+          claimName: geth-data-pvc
+      - name: jwt-secret
+        configMap:
+          name: jwt-secret
+      # Add node affinity to prefer nodes with sufficient resources
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: NotIn
+                values: ["f1-micro", "g1-small", "e2-micro", "e2-small"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lighthouse
+  namespace: ethereum
+  labels:
+    app: lighthouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lighthouse
+  template:
+    metadata:
+      labels:
+        app: lighthouse
+    spec:
+      # Disable automatic service environment variable creation
+      enableServiceLinks: false
+      containers:
+      - name: lighthouse
+        image: sigp/lighthouse:latest
+        ports:
+        - containerPort: 9000
+          name: p2p
+        - containerPort: 5052
+          name: http-api
+        volumeMounts:
+        - name: lighthouse-data
+          mountPath: /root/.lighthouse
+        - name: jwt-secret
+          mountPath: /root/jwt
+          readOnly: true
+        command:
+        - lighthouse
+        args:
+        - bn
+        - --network=sepolia
+        - --execution-endpoint=http://geth:8551
+        - --execution-jwt=/root/jwt/secret
+        - --checkpoint-sync-url=https://sepolia.beaconstate.info
+        - --http
+        - --metrics
+        # Reduced resource requirements to fit on smaller nodes
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "250m"
+          limits:
+            memory: "3Gi"
+            cpu: "750m"
+      volumes:
+      - name: lighthouse-data
+        persistentVolumeClaim:
+          claimName: lighthouse-data-pvc
+      - name: jwt-secret
+        configMap:
+          name: jwt-secret
+      # Add node affinity and tolerations for better scheduling
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: NotIn
+                values: ["f1-micro", "g1-small", "e2-micro", "e2-small"]
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
